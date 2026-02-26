@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import datetime
 from typing import List
 
@@ -6,15 +8,18 @@ from ..domain.indicators import ema, rsi, atr, NotEnoughData
 from ..infra.http.binance_client import BinanceClient
 from ..infra.storage.cache import TTLCache
 
+# Deploy doğrulama için
+SERVICE_VERSION = "MS-2026-02-26-v3"
+
+
 def _safe_float(v, default=0.0):
     try:
         return float(v)
     except Exception:
         return default
 
+
 def _parse_klines(kl: list[list]):
-    # kline format:
-    # [openTime, open, high, low, close, volume, closeTime, quoteVol, trades, ...]
     closes, highs, lows = [], [], []
     for row in kl:
         closes.append(float(row[4]))
@@ -22,22 +27,29 @@ def _parse_klines(kl: list[list]):
         lows.append(float(row[3]))
     return closes, highs, lows
 
+
 class MarketService:
-    def __init__(self, client: BinanceClient, top_n: int = 15, entry_tf: str = "15m", max_spread_pct: float = 0.12,
-                 whitelist: list[str] | None = None, min_quote_volume_24h: float = 0.0):
+    def __init__(
+        self,
+        client: BinanceClient,
+        top_n: int = 15,
+        entry_tf: str = "15m",
+        max_spread_pct: float = 0.12,
+        whitelist: list[str] | None = None,
+        min_quote_volume_24h: float = 0.0,
+    ):
         self.whitelist = whitelist or []
         self.min_quote_volume_24h = min_quote_volume_24h
         self.client = client
         self.top_n = top_n
         self.entry_tf = entry_tf
         self.max_spread_pct = max_spread_pct
-        self._cache_1d = TTLCache(3600)     # 1 saat
-        self._cache_1h = TTLCache(180)      # 3 dk
-        self._cache_entry = TTLCache(60)    # 1 dk
-        
+
+        self._cache_1d = TTLCache(3600)   # 1 saat
+        self._cache_1h = TTLCache(180)    # 3 dk
+        self._cache_entry = TTLCache(60)  # 1 dk
 
     async def get_top_symbols(self) -> List[str]:
-        # Eğer whitelist verilmişse direkt onu kullan
         if self.whitelist:
             return self.whitelist[: self.top_n]
 
@@ -55,9 +67,11 @@ class MarketService:
         tickers = await self.client.ticker_24h()
         usdt = [t for t in tickers if t.get("symbol") in allowed]
 
-        # min quote volume filtresi (illiquidleri at)
         if self.min_quote_volume_24h > 0:
-            usdt = [t for t in usdt if _safe_float(t.get("quoteVolume")) >= self.min_quote_volume_24h]
+            usdt = [
+                t for t in usdt
+                if _safe_float(t.get("quoteVolume")) >= self.min_quote_volume_24h
+            ]
 
         usdt.sort(key=lambda x: _safe_float(x.get("quoteVolume")), reverse=True)
         return [t["symbol"] for t in usdt[: self.top_n]]
@@ -65,65 +79,33 @@ class MarketService:
     async def build_signal_for(self, symbol: str) -> Signal:
         now = datetime.utcnow()
 
-        # -------- spread --------
+        # -------- spread (opsiyonel) --------
+        spread_pct: float | None = None
         try:
             bt = await self.client.book_ticker(symbol)
             bid = _safe_float(bt.get("bidPrice"))
             ask = _safe_float(bt.get("askPrice"))
-            mid = (bid + ask) / 2 if (bid and ask) else 0.0
             if bid <= 0 or ask <= 0:
                 raise ValueError("bookTicker bid/ask invalid")
-            spread_pct = ((ask - bid) / mid * 100.0) if mid > 0 else 999.0
+
+            mid = (bid + ask) / 2
+            spread_pct = ((ask - bid) / mid * 100.0) if mid > 0 else None
+
+            if spread_pct is not None and spread_pct > self.max_spread_pct:
+                return Signal(
+                    symbol=symbol,
+                    decision=Decision.WAIT,
+                    score=15,
+                    daily_trend_ok=False,
+                    updated_at=now,
+                    plan=None,
+                    reason=f"Spread yüksek ({spread_pct:.3f}%) | {SERVICE_VERSION}",
+                )
         except Exception:
-            return Signal(
-                symbol=symbol,
-                decision=Decision.WAIT,
-                score=10,
-                daily_trend_ok=False,
-                updated_at=now,
-                plan=None,
-                reason="bookTicker alınamadı / likidite düşük",
-            )
+            # bookTicker fail => spread ölçemedik ama devam
+            spread_pct = None
 
-        if spread_pct > self.max_spread_pct:
-            return Signal(
-                symbol=symbol,
-                decision=Decision.WAIT,
-                score=15,
-                daily_trend_ok=False,
-                updated_at=now,
-                plan=None,
-                reason=f"Spread yüksek ({spread_pct:.3f}%)",
-            )
-# -------- spread (opsiyonel) --------
-spread_pct: float | None = None
-try:
-    bt = await self.client.book_ticker(symbol)
-    bid = _safe_float(bt.get("bidPrice"))
-    ask = _safe_float(bt.get("askPrice"))
-    if bid <= 0 or ask <= 0:
-        raise ValueError("bookTicker bid/ask invalid")
-
-    mid = (bid + ask) / 2
-    spread_pct = ((ask - bid) / mid * 100.0) if mid > 0 else None
-
-    if spread_pct is not None and spread_pct > self.max_spread_pct:
-        return Signal(
-            symbol=symbol,
-            decision=Decision.WAIT,
-            score=15,
-            daily_trend_ok=False,
-            updated_at=now,
-            plan=None,
-            reason=f"Spread yüksek ({spread_pct:.3f}%)",
-        )
-
-except Exception:
-    # ✅ bookTicker fail => spread ölçemedik ama devam
-    spread_pct = None
-        # -------- fetch klines --------
-        # limits: daily needs 200 for EMA200, 1h needs 60-120, entry needs 120
-               # -------- fetch klines (TTL cache) --------
+        # -------- klines (TTL cache) --------
         try:
             k1 = f"{symbol}:1d:220"
             k2 = f"{symbol}:1h:120"
@@ -152,24 +134,22 @@ except Exception:
                 daily_trend_ok=False,
                 updated_at=now,
                 plan=None,
-                reason=f"Veri çekilemedi: {e}",
+                reason=f"Veri çekilemedi: {e} | {SERVICE_VERSION}",
             )
 
+        # -------- indicators --------
         try:
             d_close, d_high, d_low = _parse_klines(d1)
             h_close, h_high, h_low = _parse_klines(h1)
             e_close, e_high, e_low = _parse_klines(en)
 
-            # -------- 1d regime --------
             d_ema50 = ema(d_close, 50)
             d_ema200 = ema(d_close, 200)
             daily_ok = (d_close[-1] > d_ema50) and (d_ema50 > d_ema200)
 
-            # -------- 1h confirm --------
             h_ema50 = ema(h_close, 50)
             h_ok = (h_close[-1] > h_ema50)
 
-            # -------- entry tf signals --------
             e_ema20 = ema(e_close, 20)
             e_ema50 = ema(e_close, 50)
             e_rsi = rsi(e_close, 14)
@@ -185,7 +165,7 @@ except Exception:
                 daily_trend_ok=False,
                 updated_at=now,
                 plan=None,
-                reason=str(ne),
+                reason=f"{ne} | {SERVICE_VERSION}",
             )
         except Exception as e:
             return Signal(
@@ -195,20 +175,18 @@ except Exception:
                 daily_trend_ok=False,
                 updated_at=now,
                 plan=None,
-                reason=f"Parse/Calc hata: {e}",
+                reason=f"Parse/Calc hata: {e} | {SERVICE_VERSION}",
             )
 
-        # -------- Open Interest (opsiyonel) --------
+        # -------- Open Interest --------
         oi_score = 0
         try:
             oi = await self.client.open_interest_hist(symbol, period="5m", limit=30)
             if oi and len(oi) >= 5:
-                # openInterest values are strings
                 first = float(oi[0]["sumOpenInterest"])
                 last_oi = float(oi[-1]["sumOpenInterest"])
                 if first > 0:
                     change = (last_oi - first) / first
-                    # pozitif artış küçük bonus
                     if change > 0.02:
                         oi_score = 8
                     elif change > 0.0:
@@ -218,9 +196,9 @@ except Exception:
                     else:
                         oi_score = -2
         except Exception:
-            oi_score = 0  # fail-safe
+            oi_score = 0
 
-        # -------- scoring (MVP weights) --------
+        # -------- scoring --------
         score = 50
         score += 15 if daily_ok else -10
         score += 10 if h_ok else -8
@@ -228,13 +206,12 @@ except Exception:
         score += 6 if e_rsi >= 55 else (-6 if e_rsi <= 45 else 0)
         score += oi_score
 
-        # spread bonus (düşük spread iyi)
-        score += 6 if spread_pct <= 0.05 else 0
+        if spread_pct is not None and spread_pct <= 0.05:
+            score += 6
 
         score = max(0, min(100, int(score)))
 
-        # -------- plan (ATR based) --------
-        # Basit plan: entry=last, stop = last - 1.3*ATR, target= last + 2.0*ATR
+        # -------- plan --------
         entry = last
         stop = last - 1.3 * e_atr
         target = last + 2.0 * e_atr
@@ -250,7 +227,15 @@ except Exception:
         else:
             decision = Decision.WAIT
 
-        reason = f"1d:{'OK' if daily_ok else 'NO'} 1h:{'OK' if h_ok else 'NO'} EMA20/50:{'UP' if e_ema20>e_ema50 else 'DN'} RSI:{e_rsi:.1f} OI:{oi_score}"
+        spread_str = "-" if spread_pct is None else f"{spread_pct:.3f}%"
+        reason = (
+            f"1d:{'OK' if daily_ok else 'NO'} "
+            f"1h:{'OK' if h_ok else 'NO'} "
+            f"EMA20/50:{'UP' if e_ema20 > e_ema50 else 'DN'} "
+            f"RSI:{e_rsi:.1f} "
+            f"OI:{oi_score} "
+            f"Spread:{spread_str} | {SERVICE_VERSION}"
+        )
 
         return Signal(
             symbol=symbol,
