@@ -95,7 +95,32 @@ class MarketService:
                 plan=None,
                 reason=f"Spread yüksek ({spread_pct:.3f}%)",
             )
+# -------- spread (opsiyonel) --------
+spread_pct: float | None = None
+try:
+    bt = await self.client.book_ticker(symbol)
+    bid = _safe_float(bt.get("bidPrice"))
+    ask = _safe_float(bt.get("askPrice"))
+    if bid <= 0 or ask <= 0:
+        raise ValueError("bookTicker bid/ask invalid")
 
+    mid = (bid + ask) / 2
+    spread_pct = ((ask - bid) / mid * 100.0) if mid > 0 else None
+
+    if spread_pct is not None and spread_pct > self.max_spread_pct:
+        return Signal(
+            symbol=symbol,
+            decision=Decision.WAIT,
+            score=15,
+            daily_trend_ok=False,
+            updated_at=now,
+            plan=None,
+            reason=f"Spread yüksek ({spread_pct:.3f}%)",
+        )
+
+except Exception:
+    # ✅ bookTicker fail => spread ölçemedik ama devam
+    spread_pct = None
         # -------- fetch klines --------
         # limits: daily needs 200 for EMA200, 1h needs 60-120, entry needs 120
                # -------- fetch klines (TTL cache) --------
